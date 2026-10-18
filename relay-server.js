@@ -5,7 +5,7 @@
 import { WebSocketServer } from 'ws';
 import { randomBytes } from 'crypto';
 
-const PORT = parseInt(process.argv[2] || '8080', 10);
+const PORT = parseInt(process.env.PORT || process.argv[2] || '8080', 10);
 const rooms = new Map(); // code -> { players: [ws, ws], decisions: [], seed }
 
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
