@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.18.0"},"description":"Champion Forge multiplayer relay server","engines":{"node":">=18"},"main":"relay-server.js","name":"champion-forge-relay","scripts":{"start":"node relay-server.js"},"version":"1.0.0"}
