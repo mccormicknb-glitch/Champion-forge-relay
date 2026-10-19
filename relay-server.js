@@ -12,7 +12,7 @@ const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 function makeCode() {
   let code;
   do {
-    code = Array.from(randomBytes(4)).map(b => CODE_ALPHABET[b % 32]).join('');
+    code = Array.from(randomBytes(4)).map(b => CODE_ALPHABET[b % CODE_ALPHABET.length]).join('');
   } while (rooms.has(code));
   return code;
 }
