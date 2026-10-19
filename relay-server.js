@@ -2,6 +2,7 @@
 // Dumb relay: forwards decisions between two players in a private room.
 // Both clients run the deterministic engine; server only relays.
 // Run: node relay-server.js [port]
+import http from 'http';
 import { WebSocketServer } from 'ws';
 import { randomBytes } from 'crypto';
 
@@ -21,7 +22,12 @@ function send(ws, msg) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
 }
 
-const wss = new WebSocketServer({ port: PORT });
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Champion Forge relay OK');
+});
+const wss = new WebSocketServer({ server });
+server.listen(PORT);
 console.log(`Relay server on :${PORT}`);
 
 wss.on('connection', (ws) => {
