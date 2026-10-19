@@ -18,13 +18,14 @@ function makeCode() {
 }
 
 function send(ws, msg) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
 }
 
 const wss = new WebSocketServer({ port: PORT });
 console.log(`Relay server on :${PORT}`);
 
 wss.on('connection', (ws) => {
+  console.log('client connected');
   let roomCode = null;
   let playerIdx = -1;
 
