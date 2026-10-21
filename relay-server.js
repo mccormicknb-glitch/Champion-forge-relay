@@ -28,6 +28,8 @@
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import { randomBytes } from 'crypto';
+import { promises as fsp } from 'fs';
+import path from 'path';
 
 const PORT = parseInt(process.env.PORT || process.argv[2] || '8080', 10);
 const GRACE_MS = parseInt(process.env.RELAY_GRACE_MS || String(10 * 60 * 1000), 10);
@@ -48,7 +50,146 @@ function send(ws, msg) {
   }
 }
 
+/* ---------------- battle-log ingest (additive, 2026-10-21) ----------------
+   POST /log            — a finished game client sends its complete
+                          battle-history export (JSON {"text": "..."} or
+                          a raw text body). Stored as its own .txt file,
+                          byte-identical to the player's manual download.
+   GET  /logs           — token-guarded list of stored logs.
+   GET  /logs/<name>    — token-guarded fetch of one stored log.
+   GET  /log-count      — unguarded count of stored logs (health check).
+   The fetch endpoints require the LOG_FETCH_TOKEN env var; without it
+   they answer 503. Storage is LOG_DIR (default ./game-logs). If
+   LOG_GH_TOKEN and LOG_GH_REPO are also set, every log is additionally
+   committed to that GitHub repo under logs/ (durable sink). Nothing
+   here touches the WebSocket room/protocol logic below. */
+
+const LOG_DIR = process.env.LOG_DIR || './game-logs';
+const LOG_FETCH_TOKEN = process.env.LOG_FETCH_TOKEN || '';
+const LOG_GH_TOKEN = process.env.LOG_GH_TOKEN || '';
+const LOG_GH_REPO = process.env.LOG_GH_REPO || '';
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+async function storeBattleLog(text) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const name = `champion-forge-battle-${stamp}-${randomBytes(3).toString('hex')}.txt`;
+  await fsp.mkdir(LOG_DIR, { recursive: true });
+  await fsp.writeFile(path.join(LOG_DIR, name), text, 'utf8');
+  if (LOG_GH_TOKEN && LOG_GH_REPO) {
+    try {
+      const r = await fetch(`https://api.github.com/repos/${LOG_GH_REPO}/contents/logs/${name}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${LOG_GH_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: `Battle log ${name}`,
+          content: Buffer.from(text, 'utf8').toString('base64'),
+        }),
+      });
+      if (!r.ok) console.log(`battle log ${name}: GitHub sink answered ${r.status} (filesystem copy kept)`);
+    } catch (e) {
+      console.log(`battle log ${name}: GitHub sink error (${e.message}); filesystem copy kept`);
+    }
+  }
+  return name;
+}
+
+async function listBattleLogs() {
+  try {
+    const files = await fsp.readdir(LOG_DIR);
+    return files.filter((f) => f.startsWith('champion-forge-battle-') && f.endsWith('.txt')).sort();
+  } catch { return []; }
+}
+
 const server = http.createServer((req, res) => {
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); } catch { url = { pathname: '/' }; }
+
+  if (req.method === 'OPTIONS' && url.pathname === '/log') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    return res.end();
+  }
+
+  if (req.method === 'POST' && url.pathname === '/log') {
+    const chunks = [];
+    let size = 0;
+    let tooBig = false;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > LOG_MAX_BYTES) { tooBig = true; req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', async () => {
+      if (tooBig) return;
+      const reply = (code, obj) => {
+        res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(obj));
+      };
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let text = raw;
+        try {
+          const j = JSON.parse(raw);
+          if (j && typeof j.text === 'string') text = j.text;
+        } catch { /* raw text body: store as-is */ }
+        if (!text || text.trim().length < 20) return reply(400, { ok: false, error: 'empty log' });
+        const name = await storeBattleLog(text);
+        console.log(`battle log stored: ${name} (${text.length} chars)`);
+        return reply(202, { ok: true, id: name });
+      } catch (e) {
+        console.log('battle log store failed:', e.message);
+        return reply(500, { ok: false, error: 'store failed' });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/log-count') {
+    listBattleLogs().then((files) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ count: files.length }));
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && (url.pathname === '/logs' || url.pathname.startsWith('/logs/'))) {
+    if (!LOG_FETCH_TOKEN) {
+      res.writeHead(503, { 'Content-Type': 'text/plain' });
+      return res.end('log fetch not configured (LOG_FETCH_TOKEN unset)');
+    }
+    if (req.headers['x-log-token'] !== LOG_FETCH_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      return res.end('unauthorized');
+    }
+    if (url.pathname === '/logs') {
+      listBattleLogs().then((files) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ logs: files }));
+      });
+      return;
+    }
+    const name = path.basename(url.pathname.slice('/logs/'.length));
+    if (!name.startsWith('champion-forge-battle-') || !name.endsWith('.txt')) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      return res.end('no such log');
+    }
+    fsp.readFile(path.join(LOG_DIR, name), 'utf8').then((text) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(text);
+    }).catch(() => {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('no such log');
+    });
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Champion Forge relay OK');
 });
