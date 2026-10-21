@@ -477,6 +477,20 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (m.t === 'championName') {
+      // Additive pass-through (2026-10-21): at game start a player
+      // names their champion; the other clients apply the name to
+      // their seat maps. Forwarded to the rest of the room, stamped
+      // with the sender's own seat (the seat being named) so the
+      // attribution cannot be spoofed. No room state changes.
+      const room = myRoom();
+      if (!room || seat < 0) return;
+      const fwd = { ...m, t: 'championName', seat, playerIdx: seat };
+      if (typeof fwd.name === 'string') fwd.name = fwd.name.slice(0, 40);
+      broadcastOthers(room, ws, fwd);
+      return;
+    }
+
     if (m.t === 'surrender' || m.t === 'draw') {
       const room = myRoom();
       if (!room || seat < 0) return;
