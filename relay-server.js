@@ -52,9 +52,13 @@ function send(ws, msg) {
 
 /* ---------------- battle-log ingest (additive, 2026-10-21) ----------------
    POST /log            — a finished game client sends its complete
-                          battle-history export (JSON {"text": "..."} or
-                          a raw text body). Stored as its own .txt file,
-                          byte-identical to the player's manual download.
+                          battle-history export (JSON {"text": "..."}
+                          or a raw text body). Stored as its own .txt
+                          file, byte-identical to the player's manual
+                          download. The envelope may also carry "gameId"
+                          and "builds" (one player-card record per
+                          seat); builds are stored beside the history
+                          as <same-stem>.builds.json.
    GET  /logs           — token-guarded list of stored logs.
    GET  /logs/<name>    — token-guarded fetch of one stored log.
    GET  /log-count      — unguarded count of stored logs (health check).
@@ -70,31 +74,47 @@ const LOG_GH_TOKEN = process.env.LOG_GH_TOKEN || '';
 const LOG_GH_REPO = process.env.LOG_GH_REPO || '';
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
-async function storeBattleLog(text) {
+async function ghPutLogFile(name, content) {
+  const r = await fetch(`https://api.github.com/repos/${LOG_GH_REPO}/contents/logs/${name}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${LOG_GH_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      message: `Battle log ${name}`,
+      content: Buffer.from(content, 'utf8').toString('base64'),
+    }),
+  });
+  if (!r.ok) console.log(`battle log ${name}: GitHub sink answered ${r.status} (filesystem copy kept)`);
+}
+
+async function storeBattleLog(text, builds, gameId) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const name = `champion-forge-battle-${stamp}-${randomBytes(3).toString('hex')}.txt`;
+  const stem = `champion-forge-battle-${stamp}-${randomBytes(3).toString('hex')}`;
+  const name = `${stem}.txt`;
   await fsp.mkdir(LOG_DIR, { recursive: true });
   await fsp.writeFile(path.join(LOG_DIR, name), text, 'utf8');
+  const files = [name];
+  let buildsName = null;
+  if (Array.isArray(builds) && builds.length > 0) {
+    buildsName = `${stem}.builds.json`;
+    const payload = JSON.stringify({ gameId: gameId || stem, storedAt: new Date().toISOString(), builds }, null, 1);
+    await fsp.writeFile(path.join(LOG_DIR, buildsName), payload, 'utf8');
+    files.push(buildsName);
+  }
   if (LOG_GH_TOKEN && LOG_GH_REPO) {
-    try {
-      const r = await fetch(`https://api.github.com/repos/${LOG_GH_REPO}/contents/logs/${name}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${LOG_GH_TOKEN}`,
-          'Accept': 'application/vnd.github+json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: `Battle log ${name}`,
-          content: Buffer.from(text, 'utf8').toString('base64'),
-        }),
-      });
-      if (!r.ok) console.log(`battle log ${name}: GitHub sink answered ${r.status} (filesystem copy kept)`);
-    } catch (e) {
-      console.log(`battle log ${name}: GitHub sink error (${e.message}); filesystem copy kept`);
+    for (const f of files) {
+      try {
+        const content = await fsp.readFile(path.join(LOG_DIR, f), 'utf8');
+        await ghPutLogFile(f, content);
+      } catch (e) {
+        console.log(`battle log ${f}: GitHub sink error (${e.message}); filesystem copy kept`);
+      }
     }
   }
-  return name;
+  return { name, buildsName };
 }
 
 async function listBattleLogs() {
@@ -135,14 +155,18 @@ const server = http.createServer((req, res) => {
       try {
         const raw = Buffer.concat(chunks).toString('utf8');
         let text = raw;
+        let builds = null;
+        let gameId = null;
         try {
           const j = JSON.parse(raw);
           if (j && typeof j.text === 'string') text = j.text;
+          if (j && Array.isArray(j.builds)) builds = j.builds;
+          if (j && typeof j.gameId === 'string') gameId = j.gameId.slice(0, 80);
         } catch { /* raw text body: store as-is */ }
         if (!text || text.trim().length < 20) return reply(400, { ok: false, error: 'empty log' });
-        const name = await storeBattleLog(text);
-        console.log(`battle log stored: ${name} (${text.length} chars)`);
-        return reply(202, { ok: true, id: name });
+        const stored = await storeBattleLog(text, builds, gameId);
+        console.log(`battle log stored: ${stored.name} (${text.length} chars${stored.buildsName ? `, builds: ${stored.buildsName}` : ''})`);
+        return reply(202, { ok: true, id: stored.name, buildsId: stored.buildsName });
       } catch (e) {
         console.log('battle log store failed:', e.message);
         return reply(500, { ok: false, error: 'store failed' });
@@ -176,12 +200,14 @@ const server = http.createServer((req, res) => {
       return;
     }
     const name = path.basename(url.pathname.slice('/logs/'.length));
-    if (!name.startsWith('champion-forge-battle-') || !name.endsWith('.txt')) {
+    const isHistory = name.startsWith('champion-forge-battle-') && name.endsWith('.txt');
+    const isBuilds = name.startsWith('champion-forge-battle-') && name.endsWith('.builds.json');
+    if (!isHistory && !isBuilds) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       return res.end('no such log');
     }
     fsp.readFile(path.join(LOG_DIR, name), 'utf8').then((text) => {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.writeHead(200, { 'Content-Type': isBuilds ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8' });
       res.end(text);
     }).catch(() => {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
